@@ -1,7 +1,17 @@
+use clap::Parser;
 use rand::Rng;
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::Write;
+
+/// TCP Simulation Suite
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Run the RFC 6582/3782 NewReno exercise scenario and write output to exercise-1.typ
+    #[arg(long)]
+    exercise_1: bool,
+}
 
 #[derive(Debug, Clone)]
 enum Packet {
@@ -68,7 +78,7 @@ impl Link {
     }
 }
 
-/// Robust DiagramLogger relying strictly on `_seq` arrows to avoid CeTZ layout panics
+/// DiagramLogger generating clean inline sequence comments for chronos:0.3.0
 struct DiagramLogger {
     file: File,
     pending_state: Option<String>,
@@ -133,7 +143,7 @@ impl DiagramLogger {
         .unwrap();
     }
 
-    fn finish(mut self) {
+    fn finish(mut self, filename: &str) {
         if let Some(state) = self.pending_state.take() {
             writeln!(
                 self.file,
@@ -143,7 +153,7 @@ impl DiagramLogger {
             .unwrap();
         }
         writeln!(self.file, "  }})\n]").unwrap();
-        println!("Generated valid Typst diagram in tcp_diagram.typ!");
+        println!("Generated valid Typst diagram in {}!", filename);
     }
 }
 
@@ -457,12 +467,14 @@ fn receive_and_ack_with_dups(
     }
 }
 
-fn test_exercise_scenario() {
+fn run_exercise_1() {
+    let filename = "exercise-1.typ";
     println!("\n==================================================");
-    println!("  EXERCISE SCENARIO: Multiple Loss Recovery (NewReno)");
+    println!("  EXERCISE 1 SCENARIO: Multiple Loss Recovery (NewReno)");
+    println!("  Outputting diagram to: {}", filename);
     println!("==================================================\n");
 
-    let mut logger = DiagramLogger::new("tcp_diagram.typ");
+    let mut logger = DiagramLogger::new(filename);
     let mut link = Link::new();
     link.capacity = 20;
 
@@ -575,9 +587,16 @@ fn test_exercise_scenario() {
     println!("\n--- FINAL POST-RECOVERY STATE ---");
     alice.print();
 
-    logger.finish();
+    logger.finish(filename);
 }
 
 fn main() {
-    test_exercise_scenario();
+    let args = Args::parse();
+
+    if args.exercise_1 {
+        run_exercise_1();
+    } else {
+        println!("No exercise flag provided.");
+        println!("Run with `--exercise-1` to execute Exercise 1 scenario.");
+    }
 }
