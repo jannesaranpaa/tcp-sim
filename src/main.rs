@@ -313,8 +313,16 @@ fn test_fast_retransmit() {
     println!("\n--- Alice processes ACKs ---");
     drain_channel(&mut alice, &mut link, bob.address);
 
-    // 5. Final State Check
-    println!("\n--- FINAL STATE ---");
+    // 5. Bob receives the retransmitted packet seq=1 and ACKs up to 4
+    println!("\n--- Bob receives retransmitted packet ---");
+    receive_and_ack_with_dups(&mut bob, alice.address, &mut link, &mut bobs_expected_seq);
+
+    // 6. Alice processes the Full ACK and exits Fast Recovery
+    println!("\n--- Alice processes Full ACK ---");
+    drain_channel(&mut alice, &mut link, bob.address);
+
+    // 7. Final State Check
+    println!("\n--- FINAL POST-RECOVERY STATE ---");
     alice.print();
     bob.print();
 }
