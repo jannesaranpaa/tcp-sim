@@ -82,6 +82,9 @@ struct TCP {
     recover: u64,
     in_fast_recovery: bool,
     dup_acks: u32,
+
+    // RFC 3042 Option
+    limited_transmit: bool,
 }
 
 impl TCP {
@@ -110,7 +113,14 @@ impl TCP {
             recover: 0,
             dup_acks: 0,
             in_fast_recovery: false,
+
+            limited_transmit: false,
         }
+    }
+
+    fn with_limited_transmit(mut self, enabled: bool) -> Self {
+        self.limited_transmit = enabled;
+        self
     }
 
     fn send(&mut self, data: Packet, to: Address, link: &mut Link) {
@@ -213,6 +223,18 @@ impl TCP {
                         );
                         link.send(Packet::rand_data(missing_seq, 20), peer_addr);
                     }
+                } else if self.limited_transmit && self.dup_acks < 3 {
+                    // --- RFC 3042: LIMITED TRANSMIT ---
+                    // Transmit 1 unsent packet for each of the 1st and 2nd duplicate ACKs
+                    let next_unsent_seq = self.unacknowledged.last().map_or(0, |last| last + 1);
+
+                    if self.flight_size() < self.send_window() {
+                        println!(
+                            "{} -> [Limited Transmit] DupACK #{} received! Transmitting new seq {}",
+                            self.name, self.dup_acks, next_unsent_seq
+                        );
+                        self.send(Packet::rand_data(next_unsent_seq, 20), peer_addr, link);
+                    }
                 }
             } else {
                 // Additional DupACK while in Fast Recovery: Inflate cwnd by 1 SMSS
@@ -235,13 +257,14 @@ impl TCP {
         println!("┌──────────────────────────────────────────────┐");
         println!("│ {:<44} │", format!("Endpoint: {} [{}]", self.name, phase));
         println!("├──────────────────────────────────────────────┤");
-        println!("│ Address:        {:<27}  │", self.address);
-        println!("│ cwnd:           {:<27}  │", self.cwnd);
-        println!("│ ssthresh:       {:<27}  │", self.ssthresh);
-        println!("│ dup_acks:       {:<27}  │", self.dup_acks);
-        println!("│ recover:        {:<27}  │", self.recover);
-        println!("│ FlightSize:     {:<27}  │", self.flight_size());
-        println!("│ unacknowledged: {:<27}  │", unack_str);
+        println!("│ Address:          {:<26} │", self.address);
+        println!("│ cwnd:             {:<26} │", self.cwnd);
+        println!("│ ssthresh:         {:<26} │", self.ssthresh);
+        println!("│ dup_acks:         {:<26} │", self.dup_acks);
+        println!("│ limited_transmit: {:<26} │", self.limited_transmit);
+        println!("│ recover:          {:<26} │", self.recover);
+        println!("│ FlightSize:       {:<26} │", self.flight_size());
+        println!("│ unacknowledged:   {:<26} │", unack_str);
         println!("└──────────────────────────────────────────────┘\n");
     }
 }
@@ -283,50 +306,144 @@ fn receive_and_ack_with_dups(
     }
 }
 
-fn test_fast_retransmit() {
+fn test_limited_transmit() {
     println!("\n==========================================");
-    println!("  TEST: 3x DupACK / Fast Retransmit");
+    println!("  TEST: RFC 3042 Limited Transmit");
     println!("==========================================\n");
 
     let mut link = Link::new();
     link.capacity = 10;
 
-    let mut alice = TCP::new("Alice", &mut link);
+    let mut alice = TCP::new("Alice", &mut link).with_limited_transmit(true);
     let mut bob = TCP::new("Bob", &mut link);
 
-    // 1. Alice sends packets 0, 1, 2, 3, 4
-    for seq in 0..5 {
+    // Initial transmission batch (seq 0, 1, 2)
+    for seq in 0..3 {
         alice.send(Packet::rand_data(seq, 20), bob.address, &mut link);
     }
 
-    // 2. Simulate packet loss in transit: drop packet 1
+    // Drop seq=1
     if let Some(channel) = link.channels.get_mut(&bob.address) {
-        channel.remove(1); // Drops seq=1
+        channel.remove(1);
         println!("*** [SIMULATED NETWORK DISRUPTION: Packet seq=1 dropped] ***\n");
     }
 
-    // 3. Bob processes incoming packets
     let mut bobs_expected_seq = 0;
+
+    println!("--- Bob processes initial batch ---");
     receive_and_ack_with_dups(&mut bob, alice.address, &mut link, &mut bobs_expected_seq);
 
-    // 4. Alice processes incoming ACKs from Bob
-    println!("\n--- Alice processes ACKs ---");
+    println!("\n--- Alice processes ACKs & triggers Limited Transmit ---");
     drain_channel(&mut alice, &mut link, bob.address);
 
-    // 5. Bob receives the retransmitted packet seq=1 and ACKs up to 4
-    println!("\n--- Bob receives retransmitted packet ---");
+    println!("\n--- Bob processes Limited Transmit packet ---");
     receive_and_ack_with_dups(&mut bob, alice.address, &mut link, &mut bobs_expected_seq);
 
-    // 6. Alice processes the Full ACK and exits Fast Recovery
-    println!("\n--- Alice processes Full ACK ---");
+    println!("\n--- Alice processes DupACK #2 ---");
     drain_channel(&mut alice, &mut link, bob.address);
 
-    // 7. Final State Check
-    println!("\n--- FINAL POST-RECOVERY STATE ---");
+    println!("\n--- FINAL STATE ---");
     alice.print();
     bob.print();
 }
 
+fn test_limited_transmit_comparison() {
+    println!("\n==================================================");
+    println!("  COMPARISON: Limited Transmit OFF vs. ON");
+    println!("==================================================\n");
+
+    // ----------------------------------------------------
+    // SCENARIO A: Limited Transmit OFF (Default TCP behavior)
+    // ----------------------------------------------------
+    println!("============================================");
+    println!("  SCENARIO A: Limited Transmit = OFF");
+    println!("============================================\n");
+
+    let mut link = Link::new();
+    link.capacity = 10;
+
+    let mut alice = TCP::new("Alice", &mut link).with_limited_transmit(false);
+    let mut bob = TCP::new("Bob", &mut link);
+
+    println!("--- Alice sends 3 packets (seq 0, 1, 2) ---");
+    for seq in 0..3 {
+        alice.send(Packet::rand_data(seq, 20), bob.address, &mut link);
+    }
+
+    if let Some(channel) = link.channels.get_mut(&bob.address) {
+        channel.remove(1); // Drop packet seq 1
+        println!("*** [NETWORK LOSS: Packet seq=1 dropped] ***\n");
+    }
+
+    let mut bobs_expected_seq = 0;
+
+    println!("--- Bob processes incoming batch ---");
+    receive_and_ack_with_dups(&mut bob, alice.address, &mut link, &mut bobs_expected_seq);
+
+    println!("\n--- Alice processes ACKs ---");
+    drain_channel(&mut alice, &mut link, bob.address);
+
+    println!("\n--- RESULT (LIMITED TRANSMIT OFF) ---");
+    alice.print();
+    println!("Notice: Alice only received 1 DupACK! Fast Retransmit CANNOT trigger.");
+    println!("Alice is STUCK waiting for a Retransmission Timeout (RTO)!\n");
+
+    // ----------------------------------------------------
+    // SCENARIO B: Limited Transmit ON (RFC 3042 behavior)
+    // ----------------------------------------------------
+    println!("\n============================================");
+    println!("  SCENARIO B: Limited Transmit = ON");
+    println!("============================================\n");
+
+    let mut link = Link::new();
+    link.capacity = 10;
+
+    let mut alice = TCP::new("Alice", &mut link).with_limited_transmit(true);
+    let mut bob = TCP::new("Bob", &mut link);
+
+    println!("--- Alice sends initial 3 packets (seq 0, 1, 2) ---");
+    for seq in 0..3 {
+        alice.send(Packet::rand_data(seq, 20), bob.address, &mut link);
+    }
+
+    if let Some(channel) = link.channels.get_mut(&bob.address) {
+        channel.remove(1); // Drop packet seq 1
+        println!("*** [NETWORK LOSS: Packet seq=1 dropped] ***\n");
+    }
+
+    let mut bobs_expected_seq = 0;
+
+    println!("--- Bob processes initial batch (receives 0 & 2) ---");
+    receive_and_ack_with_dups(&mut bob, alice.address, &mut link, &mut bobs_expected_seq);
+
+    println!("\n--- Alice processes ACKs & triggers Limited Transmit ---");
+    drain_channel(&mut alice, &mut link, bob.address);
+
+    println!("\n--- Bob processes Limited Transmit packet (seq 3) ---");
+    receive_and_ack_with_dups(&mut bob, alice.address, &mut link, &mut bobs_expected_seq);
+
+    println!("\n--- Alice processes DupACK #2 (from seq 3) ---");
+    drain_channel(&mut alice, &mut link, bob.address);
+
+    println!("\n--- Bob receives seq 4 and generates DupACK #3 ---");
+    receive_and_ack_with_dups(&mut bob, alice.address, &mut link, &mut bobs_expected_seq);
+
+    println!("\n--- Alice receives DupACK #3 and triggers Fast Retransmit ---");
+    drain_channel(&mut alice, &mut link, bob.address);
+
+    println!("\n--- Bob receives retransmitted packet seq 1 ---");
+    receive_and_ack_with_dups(&mut bob, alice.address, &mut link, &mut bobs_expected_seq);
+
+    println!("\n--- Alice receives Full ACK and completes recovery ---");
+    drain_channel(&mut alice, &mut link, bob.address);
+
+    println!("\n--- RESULT (LIMITED TRANSMIT ON) ---");
+    alice.print();
+    println!("Success! Limited Transmit sent unsent data to generate enough DupACKs,");
+    println!("allowing Fast Retransmit to recover the lost packet without an RTO delay!");
+}
+
 fn main() {
-    test_fast_retransmit();
+    test_limited_transmit();
+    test_limited_transmit_comparison();
 }
