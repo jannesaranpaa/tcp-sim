@@ -82,6 +82,8 @@ struct TCP {
 
     unacknowledged: Vec<u64>,
     address: Address,
+
+    dup_ack_count: HashMap<u64, u32>,
 }
 
 impl TCP {
@@ -98,6 +100,8 @@ impl TCP {
 
             unacknowledged: vec![],
             address: link.register(),
+
+            dup_ack_count: HashMap::new(),
         }
     }
 
@@ -116,8 +120,20 @@ impl TCP {
 
             match data {
                 Packet::Ack { ack_seq } => {
-                    self.unacknowledged
-                        .remove(self.unacknowledged.iter().position(|val| *val == ack_seq)?);
+                    if let Some(idx) = self.unacknowledged.iter().position(|val| *val == ack_seq) {
+                        self.unacknowledged.remove(idx);
+                        self.dup_ack_count.remove(&ack_seq);
+                    } else {
+                        let count = self.dup_ack_count.entry(ack_seq).or_insert(0);
+                        *count += 1;
+
+                        if *count == 3 {
+                            println!(
+                                "{} -> FAST RETRANSMISSION triggered for {}",
+                                self.name, ack_seq
+                            );
+                        }
+                    }
                 }
                 _ => (),
             }
@@ -136,39 +152,83 @@ impl TCP {
     }
 }
 
-fn main() {
-    let mut link = Link::new(); // capacity: 3
-    let mut sender = TCP::new("Alice", &mut link);
-    let mut receiver = TCP::new("Bob", &mut link);
-
-    println!("== SIMULATING PACKET LOSS & TIMEOUT STATE ==\n");
-
-    // 1. Alice sends 5 packets (0..=4) in one burst.
-    // Packets 0, 1, 2 fit in Link. Packets 3 & 4 are DROPPED.
-    println!("--- Alice sends 5 packets ---");
-    for seq in 0..5 {
-        sender.send(Packet::rand_data(seq, 20), receiver.address, &mut link);
+fn drain_channel(endpoint: &mut TCP, link: &mut Link) -> Vec<Packet> {
+    let mut received = Vec::new();
+    while let Some(packet) = endpoint.receive(link) {
+        received.push(packet);
     }
+    received
+}
 
-    sender.print();
-
-    // 2. Bob reads all packets currently sitting in Link (0, 1, 2)
-    // and sends an ACK back for each one.
-    println!("--- Bob processes incoming queue ---");
-    while let Some(packet) = receiver.receive(&mut link) {
+fn receive_and_ack_with_dups(
+    receiver: &mut TCP,
+    sender_addr: Address,
+    link: &mut Link,
+    expected_seq: &mut u64,
+) {
+    while let Some(packet) = receiver.receive(link) {
         if let Packet::Data { seq, .. } = packet {
-            receiver.send(Packet::new_ack(seq), sender.address, &mut link);
+            if seq == *expected_seq {
+                // In-order packet received: advance expected sequence
+                *expected_seq += 1;
+                receiver.send(Packet::new_ack(seq), sender_addr, link);
+            } else {
+                // Out-of-order packet! Repeat ACK for the last successfully received sequence
+                let last_ack = if *expected_seq > 0 {
+                    *expected_seq - 1
+                } else {
+                    0
+                };
+                println!(
+                    "--> Out-of-order seq {}! Sending duplicate ACK for {}",
+                    seq, last_ack
+                );
+                receiver.send(Packet::new_ack(last_ack), sender_addr, link);
+            }
         }
     }
+}
 
-    // 3. Alice reads the ACKs sent by Bob from Link.
-    println!("--- Alice processes incoming ACKs ---");
-    while let Some(packet) = sender.receive(&mut link) {
-        // TCP::receive automatically removes acked seq numbers from unacknowledged
+fn test_fast_retransmit() {
+    println!("\n==========================================");
+    println!("  TEST: 3x DupACK / Fast Retransmit");
+    println!("==========================================\n");
+
+    let mut link = Link::new();
+    link.capacity = 10; // Large capacity so packets aren't dropped by Link queue size
+
+    let mut alice = TCP::new("Alice", &mut link);
+    let mut bob = TCP::new("Bob", &mut link);
+
+    // 1. Alice sends packets 0, 1, 2, 3, 4
+    for seq in 0..5 {
+        alice.send(Packet::rand_data(seq, 20), bob.address, &mut link);
     }
 
-    // 4. Final state check
-    println!("--- FINAL STATE ---");
-    sender.print();
-    receiver.print();
+    // 2. Simulate packet loss in transit: manually remove packet 1 from Bob's channel
+    if let Some(channel) = link.channels.get_mut(&bob.address) {
+        channel.remove(1); // Drops packet with seq=1
+        println!("*** [SIMULATED NETWORK DISRUPTION: Packet seq=1 dropped] ***\n");
+    }
+
+    // 3. Bob processes incoming packets:
+    // Receives 0 (In-order) -> ACKs 0 (Expected becomes 1)
+    // Receives 2 (Out-of-order!) -> Sends DupACK 0
+    // Receives 3 (Out-of-order!) -> Sends DupACK 0
+    // Receives 4 (Out-of-order!) -> Sends DupACK 0 (Total: 3 DupACKs for seq 0)
+    let mut bobs_expected_seq = 0;
+    receive_and_ack_with_dups(&mut bob, alice.address, &mut link, &mut bobs_expected_seq);
+
+    // 4. Alice processes all incoming ACKs from Bob
+    println!("\n--- Alice processes ACKs ---");
+    drain_channel(&mut alice, &mut link);
+
+    // 5. Final State Check
+    println!("\n--- FINAL STATE ---");
+    alice.print();
+    bob.print();
+}
+
+fn main() {
+    test_fast_retransmit();
 }
