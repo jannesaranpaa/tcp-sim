@@ -7,8 +7,6 @@ enum Packet {
     Data { seq: u64, payload: Vec<u8> },
 }
 
-// struct Packet(Vec<u8>);
-
 impl Packet {
     fn new_ack(ack_seq: u64) -> Self {
         Packet::Ack { ack_seq }
@@ -52,8 +50,6 @@ impl Link {
     }
 
     fn send(&mut self, packet: Packet, addr: Address) {
-        // Simulate dropping if capacity is full
-
         if let Some(channel) = self.channels.get_mut(&addr) {
             if channel.len() < self.capacity {
                 channel.push_back(packet);
@@ -72,36 +68,48 @@ impl Link {
 
 struct TCP {
     name: String,
-    smss: u32,
-    rmss: u32,
-    rwnd: u32,
-    cwnd: u32,
-    iw: u32,
-    lw: u32,
-    rw: u32,
-
-    unacknowledged: Vec<u64>,
     address: Address,
 
-    dup_ack_count: HashMap<u64, u32>,
+    unacknowledged: Vec<u64>,
+
+    // Standard TCP state
+    smss: u32,
+    rwnd: u32,
+    cwnd: u32,
+    ssthresh: u32,
+
+    // NewReno
+    recover: u64,
+    in_fast_recovery: bool,
+    dup_acks: u32,
 }
 
 impl TCP {
+    fn flight_size(&self) -> u32 {
+        self.unacknowledged.len() as u32
+    }
+
+    fn send_window(&self) -> u32 {
+        self.cwnd.min(self.rwnd)
+    }
+
     fn new(name: &str, link: &mut Link) -> Self {
         Self {
             name: String::from(name),
-            smss: 1000,
-            rmss: 1000,
+
+            smss: 1, // One packet!
+
             rwnd: 10,
             cwnd: 10,
-            iw: 1,
-            lw: 1,
-            rw: 1,
+
+            ssthresh: 64,
 
             unacknowledged: vec![],
             address: link.register(),
 
-            dup_ack_count: HashMap::new(),
+            recover: 0,
+            dup_acks: 0,
+            in_fast_recovery: false,
         }
     }
 
@@ -114,33 +122,102 @@ impl TCP {
         link.send(data, to);
     }
 
-    fn receive(&mut self, link: &mut Link) -> Option<Packet> {
-        if let Some(data) = link.receive(self.address) {
-            println!("{} received: {:?}", self.name, data);
+    fn receive(&mut self, link: &mut Link, peer_addr: Address) -> Option<Packet> {
+        let data = link.receive(self.address)?;
+        println!("{} received: {:?}", self.name, data);
 
-            match data {
-                Packet::Ack { ack_seq } => {
-                    if let Some(idx) = self.unacknowledged.iter().position(|val| *val == ack_seq) {
-                        self.unacknowledged.remove(idx);
-                        self.dup_ack_count.remove(&ack_seq);
-                    } else {
-                        let count = self.dup_ack_count.entry(ack_seq).or_insert(0);
-                        *count += 1;
+        if let Packet::Ack { ack_seq } = data {
+            self.on_ack_received(ack_seq, peer_addr, link);
+        }
 
-                        if *count == 3 {
-                            println!(
-                                "{} -> FAST RETRANSMISSION triggered for {}",
-                                self.name, ack_seq
-                            );
-                        }
+        Some(data)
+    }
+
+    fn on_ack_received(&mut self, ack_seq: u64, peer_addr: Address, link: &mut Link) {
+        let newly_acked = self
+            .unacknowledged
+            .iter()
+            .filter(|&&seq| seq <= ack_seq)
+            .count();
+
+        if newly_acked > 0 {
+            self.unacknowledged.retain(|&seq| seq > ack_seq);
+
+            if self.in_fast_recovery {
+                if ack_seq >= self.recover {
+                    // FULL ACK: Exits Fast Recovery
+                    println!(
+                        "{} -> Full ACK ({}) received! Exiting Fast Recovery.",
+                        self.name, ack_seq
+                    );
+                    self.cwnd = self.ssthresh; // Deflate window back to ssthresh
+                    self.dup_acks = 0;
+                    self.in_fast_recovery = false;
+                } else {
+                    // PARTIAL ACK: Retransmit the next unacknowledged packet immediately
+                    println!(
+                        "{} -> Partial ACK ({}) received! Retransmitting next missing packet.",
+                        self.name, ack_seq
+                    );
+
+                    // Deflate cwnd by amount of new data, plus 1 SMSS per NewReno spec
+                    self.cwnd = self.cwnd.saturating_sub(newly_acked as u32) + self.smss;
+
+                    // Immediately retransmit the first missing packet
+                    if let Some(&missing_seq) = self.unacknowledged.first() {
+                        println!(
+                            "{} -> [Partial ACK Retransmit] Sending seq {}",
+                            self.name, missing_seq
+                        );
+                        link.send(Packet::rand_data(missing_seq, 20), peer_addr);
                     }
                 }
-                _ => (),
+            } else {
+                self.dup_acks = 0;
+                if self.cwnd < self.ssthresh {
+                    // Slow Start: Exponential growth (+1 SMSS per ACK)
+                    self.cwnd += self.smss;
+                } else {
+                    // Congestion Avoidance: Linear growth (+1/cwnd per ACK)
+                    self.cwnd += self.smss / self.cwnd.max(1);
+                }
             }
-
-            Some(data)
         } else {
-            None
+            // --- DUPLICATE ACK ---
+            self.dup_acks += 1;
+
+            if !self.in_fast_recovery {
+                if self.dup_acks == 3 {
+                    // TRIGGER FAST RETRANSMISSION & ENTER FAST RECOVERY
+                    println!(
+                        "⚡ {} -> 3x DupACK ({})! Triggering Fast Retransmit.",
+                        self.name, ack_seq
+                    );
+
+                    // 1. Set recover to the highest sequence number sent so far
+                    self.recover = *self.unacknowledged.last().unwrap_or(&ack_seq);
+
+                    // 2. Adjust ssthresh = max(FlightSize / 2, 2 * SMSS)
+                    let flight_size = self.flight_size();
+                    self.ssthresh = (flight_size / 2).max(2 * self.smss);
+
+                    // 3. Inflate cwnd = ssthresh + 3 * SMSS
+                    self.cwnd = self.ssthresh + 3 * self.smss;
+                    self.in_fast_recovery = true;
+
+                    // 4. Retransmit the missing packet (first unacknowledged)
+                    if let Some(&missing_seq) = self.unacknowledged.first() {
+                        println!(
+                            "{} -> [Fast Retransmit] Resending lost packet seq {}",
+                            self.name, missing_seq
+                        );
+                        link.send(Packet::rand_data(missing_seq, 20), peer_addr);
+                    }
+                }
+            } else {
+                // Additional DupACK while in Fast Recovery: Inflate cwnd by 1 SMSS
+                self.cwnd += self.smss;
+            }
         }
     }
 
@@ -152,9 +229,9 @@ impl TCP {
     }
 }
 
-fn drain_channel(endpoint: &mut TCP, link: &mut Link) -> Vec<Packet> {
+fn drain_channel(endpoint: &mut TCP, link: &mut Link, peer_addr: Address) -> Vec<Packet> {
     let mut received = Vec::new();
-    while let Some(packet) = endpoint.receive(link) {
+    while let Some(packet) = endpoint.receive(link, peer_addr) {
         received.push(packet);
     }
     received
@@ -166,7 +243,7 @@ fn receive_and_ack_with_dups(
     link: &mut Link,
     expected_seq: &mut u64,
 ) {
-    while let Some(packet) = receiver.receive(link) {
+    while let Some(packet) = receiver.receive(link, sender_addr) {
         if let Packet::Data { seq, .. } = packet {
             if seq == *expected_seq {
                 // In-order packet received: advance expected sequence
@@ -195,7 +272,7 @@ fn test_fast_retransmit() {
     println!("==========================================\n");
 
     let mut link = Link::new();
-    link.capacity = 10; // Large capacity so packets aren't dropped by Link queue size
+    link.capacity = 10;
 
     let mut alice = TCP::new("Alice", &mut link);
     let mut bob = TCP::new("Bob", &mut link);
@@ -205,23 +282,19 @@ fn test_fast_retransmit() {
         alice.send(Packet::rand_data(seq, 20), bob.address, &mut link);
     }
 
-    // 2. Simulate packet loss in transit: manually remove packet 1 from Bob's channel
+    // 2. Simulate packet loss in transit: drop packet 1
     if let Some(channel) = link.channels.get_mut(&bob.address) {
-        channel.remove(1); // Drops packet with seq=1
+        channel.remove(1); // Drops seq=1
         println!("*** [SIMULATED NETWORK DISRUPTION: Packet seq=1 dropped] ***\n");
     }
 
-    // 3. Bob processes incoming packets:
-    // Receives 0 (In-order) -> ACKs 0 (Expected becomes 1)
-    // Receives 2 (Out-of-order!) -> Sends DupACK 0
-    // Receives 3 (Out-of-order!) -> Sends DupACK 0
-    // Receives 4 (Out-of-order!) -> Sends DupACK 0 (Total: 3 DupACKs for seq 0)
+    // 3. Bob processes incoming packets
     let mut bobs_expected_seq = 0;
     receive_and_ack_with_dups(&mut bob, alice.address, &mut link, &mut bobs_expected_seq);
 
-    // 4. Alice processes all incoming ACKs from Bob
+    // 4. Alice processes incoming ACKs from Bob
     println!("\n--- Alice processes ACKs ---");
-    drain_channel(&mut alice, &mut link);
+    drain_channel(&mut alice, &mut link, bob.address);
 
     // 5. Final State Check
     println!("\n--- FINAL STATE ---");
