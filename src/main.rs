@@ -222,10 +222,27 @@ impl TCP {
     }
 
     fn print(&self) {
-        println!("{}", self.name);
-        println!("cwnd: {}", self.cwnd);
-        println!("unackd: {:?}", self.unacknowledged);
-        println!("");
+        let phase = if self.in_fast_recovery {
+            "FAST RECOVERY"
+        } else if self.cwnd < self.ssthresh {
+            "SLOW START"
+        } else {
+            "CONGESTION AVOIDANCE"
+        };
+
+        let unack_str = format!("{:?}", self.unacknowledged);
+
+        println!("┌──────────────────────────────────────────────┐");
+        println!("│ {:<44} │", format!("Endpoint: {} [{}]", self.name, phase));
+        println!("├──────────────────────────────────────────────┤");
+        println!("│ Address:        {:<27}  │", self.address);
+        println!("│ cwnd:           {:<27}  │", self.cwnd);
+        println!("│ ssthresh:       {:<27}  │", self.ssthresh);
+        println!("│ dup_acks:       {:<27}  │", self.dup_acks);
+        println!("│ recover:        {:<27}  │", self.recover);
+        println!("│ FlightSize:     {:<27}  │", self.flight_size());
+        println!("│ unacknowledged: {:<27}  │", unack_str);
+        println!("└──────────────────────────────────────────────┘\n");
     }
 }
 
