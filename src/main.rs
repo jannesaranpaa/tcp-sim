@@ -4,19 +4,15 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::Write;
 
-/// TCP Simulation Suite
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Run the RFC 6582/3782 NewReno exercise 1 scenario and write output to exercise-1.typ
     #[arg(long)]
     exercise_1: bool,
 
-    /// Run the RFC 6582/3782 NewReno exercise 2 scenario and write output to exercise-2.typ
     #[arg(long)]
     exercise_2: bool,
 
-    /// Run Exercise 3: Exercise 2 scenario WITH Limited Transmit to exercise-3.typ
     #[arg(long)]
     exercise_3: bool,
 }
@@ -29,18 +25,13 @@ enum Packet {
 
 impl Packet {
     fn new_ack(ack_seq: u64) -> Self {
-        Packet::Ack { ack_seq }
-    }
-
-    fn new_data(seq: u64, payload: Vec<u8>) -> Self {
-        Packet::Data { seq, payload }
+        Self::Ack { ack_seq }
     }
 
     fn rand_data(seq: u64, size: usize) -> Self {
-        let mut data = vec![0u8; size];
-        rand::rng().fill_bytes(&mut data);
-
-        Packet::new_data(seq, data)
+        let mut payload = vec![0u8; size];
+        rand::rng().fill_bytes(&mut payload);
+        Self::Data { seq, payload }
     }
 }
 
@@ -65,7 +56,6 @@ impl Link {
         let addr = self.last_addr;
         self.channels.insert(addr, VecDeque::new());
         self.last_addr += 1;
-
         addr
     }
 
@@ -78,15 +68,10 @@ impl Link {
     }
 
     fn receive(&mut self, addr: Address) -> Option<Packet> {
-        if let Some(channel) = self.channels.get_mut(&addr) {
-            return channel.pop_front();
-        }
-
-        None
+        self.channels.get_mut(&addr)?.pop_front()
     }
 }
 
-/// DiagramLogger generating clean inline sequence comments for chronos:0.3.0
 struct DiagramLogger {
     file: File,
     pending_state: Option<String>,
@@ -94,7 +79,7 @@ struct DiagramLogger {
 
 impl DiagramLogger {
     fn new(filename: &str) -> Self {
-        let mut file = File::create(filename).expect("Failed to create diagram file");
+        let mut file = File::create(filename).expect("failed to create diagram output file");
 
         writeln!(file, "#import \"@preview/chronos:0.3.0\": *").unwrap();
         writeln!(
@@ -119,34 +104,31 @@ impl DiagramLogger {
     }
 
     fn log_send_data(&mut self, seq: u64) {
-        let comment = if let Some(state) = self.pending_state.take() {
-            format!("Seg. {} \\ ({})", seq, state)
-        } else {
-            format!("Seg. {}", seq)
+        let comment = match self.pending_state.take() {
+            Some(state) => format!("Seg. {seq} \\ ({state})"),
+            None => format!("Seg. {seq}"),
         };
-        writeln!(self.file, "    _seq(\"S\", \"R\", comment: [{}])", comment).unwrap();
+        writeln!(self.file, "    _seq(\"S\", \"R\", comment: [{comment}])").unwrap();
     }
 
     fn log_send_ack(&mut self, ack_seq: u64, is_dup: bool) {
-        let ack_label = if is_dup {
-            format!("DupACK {}", ack_seq)
+        let label = if is_dup {
+            format!("DupACK {ack_seq}")
         } else {
-            format!("Ack. {}", ack_seq)
+            format!("Ack. {ack_seq}")
         };
 
-        let comment = if let Some(state) = self.pending_state.take() {
-            format!("{} \\ ({})", ack_label, state)
-        } else {
-            ack_label
+        let comment = match self.pending_state.take() {
+            Some(state) => format!("{label} \\ ({state})"),
+            None => label,
         };
-        writeln!(self.file, "    _seq(\"R\", \"S\", comment: [{}])", comment).unwrap();
+        writeln!(self.file, "    _seq(\"R\", \"S\", comment: [{comment}])").unwrap();
     }
 
     fn log_loss(&mut self, seq: u64) {
         writeln!(
             self.file,
-            "    _seq(\"S\", \"R\", comment: [Seg. {} Dropped])",
-            seq
+            "    _seq(\"S\", \"R\", comment: [Seg. {seq} Dropped])"
         )
         .unwrap();
     }
@@ -155,34 +137,26 @@ impl DiagramLogger {
         if let Some(state) = self.pending_state.take() {
             writeln!(
                 self.file,
-                "    _seq(\"S\", \"R\", comment: [Final State: {}])",
-                state
+                "    _seq(\"S\", \"R\", comment: [Final State: {state}])"
             )
             .unwrap();
         }
         writeln!(self.file, "  }})\n]").unwrap();
-        println!("Generated valid Typst diagram in {}!", filename);
+        println!("Generated diagram in {filename}");
     }
 }
 
 struct TCP {
     name: String,
     address: Address,
-
     unacknowledged: Vec<u64>,
-
-    // Standard TCP state
     smss: u32,
     rwnd: u32,
     cwnd: u32,
     ssthresh: u32,
-
-    // NewReno
     recover: u64,
     in_fast_recovery: bool,
     dup_acks: u32,
-
-    // RFC 3042 Option
     limited_transmit: bool,
 }
 
@@ -197,22 +171,16 @@ impl TCP {
 
     fn new(name: &str, link: &mut Link) -> Self {
         Self {
-            name: String::from(name),
-
+            name: name.to_string(),
+            address: link.register(),
+            unacknowledged: Vec::new(),
             smss: 1,
-
             rwnd: 10,
             cwnd: 10,
-
             ssthresh: 64,
-
-            unacknowledged: vec![],
-            address: link.register(),
-
             recover: 0,
-            dup_acks: 0,
             in_fast_recovery: false,
-
+            dup_acks: 0,
             limited_transmit: false,
         }
     }
@@ -224,23 +192,25 @@ impl TCP {
 
     fn send(
         &mut self,
-        data: Packet,
+        packet: Packet,
         to: Address,
         link: &mut Link,
         logger: &mut Option<&mut DiagramLogger>,
     ) {
-        if let Packet::Data { seq, .. } = data {
-            self.unacknowledged.push(seq);
-            if let Some(log) = logger {
-                log.log_send_data(seq);
+        match packet {
+            Packet::Data { seq, .. } => {
+                self.unacknowledged.push(seq);
+                if let Some(log) = logger {
+                    log.log_send_data(seq);
+                }
             }
-        } else if let Packet::Ack { ack_seq } = data {
-            if let Some(log) = logger {
-                log.log_send_ack(ack_seq, false);
+            Packet::Ack { ack_seq } => {
+                if let Some(log) = logger {
+                    log.log_send_ack(ack_seq, false);
+                }
             }
         }
-
-        link.send(data, to);
+        link.send(packet, to);
     }
 
     fn receive(
@@ -249,14 +219,14 @@ impl TCP {
         peer_addr: Address,
         logger: &mut Option<&mut DiagramLogger>,
     ) -> Option<Packet> {
-        let data = link.receive(self.address)?;
-        println!("{} received: {:?}", self.name, data);
+        let packet = link.receive(self.address)?;
+        println!("{} received: {:?}", self.name, packet);
 
-        if let Packet::Ack { ack_seq } = data {
+        if let Packet::Ack { ack_seq } = packet {
             self.on_ack_received(ack_seq, peer_addr, link, logger);
         }
 
-        Some(data)
+        Some(packet)
     }
 
     fn on_ack_received(
@@ -277,10 +247,9 @@ impl TCP {
 
             if self.in_fast_recovery {
                 if ack_seq >= self.recover {
-                    // FULL ACK: Exits Fast Recovery
                     println!(
-                        "{} -> Full ACK ({}) received! Exiting Fast Recovery.",
-                        self.name, ack_seq
+                        "{} -> Full ACK ({ack_seq}) received, exiting Fast Recovery.",
+                        self.name
                     );
                     self.cwnd = self.ssthresh;
                     self.dup_acks = 0;
@@ -296,12 +265,10 @@ impl TCP {
                         );
                     }
                 } else {
-                    // PARTIAL ACK: Retransmit next unacknowledged packet immediately
                     println!(
-                        "{} -> Partial ACK ({}) received! Retransmitting next missing packet.",
-                        self.name, ack_seq
+                        "{} -> Partial ACK ({ack_seq}) received, retransmitting.",
+                        self.name
                     );
-
                     self.cwnd = self.cwnd.saturating_sub(newly_acked as u32) + self.smss;
 
                     if let Some(log) = logger {
@@ -315,10 +282,6 @@ impl TCP {
                     }
 
                     if let Some(&missing_seq) = self.unacknowledged.first() {
-                        println!(
-                            "{} -> [Partial ACK Retransmit] Sending seq {}",
-                            self.name, missing_seq
-                        );
                         self.send(Packet::rand_data(missing_seq, 20), peer_addr, link, logger);
                     }
                 }
@@ -330,104 +293,88 @@ impl TCP {
                     self.cwnd += self.smss / self.cwnd.max(1);
                 }
             }
-        } else {
-            // --- DUPLICATE ACK ---
-            self.dup_acks += 1;
+            return;
+        }
 
-            if !self.in_fast_recovery {
-                if self.dup_acks == 3 {
-                    // TRIGGER FAST RETRANSMISSION & ENTER FAST RECOVERY
-                    println!(
-                        "{} -> 3x DupACK ({})! Triggering Fast Retransmit.",
-                        self.name, ack_seq
-                    );
+        self.dup_acks += 1;
 
-                    self.recover = *self.unacknowledged.last().unwrap_or(&ack_seq);
-                    let flight_size = self.flight_size();
-                    self.ssthresh = (flight_size / 2).max(2 * self.smss);
-                    self.cwnd = self.ssthresh + 3 * self.smss;
-                    self.in_fast_recovery = true;
-
-                    if let Some(log) = logger {
-                        log.log_state(
-                            "Fast Retransmit",
-                            self.cwnd,
-                            self.ssthresh,
-                            self.dup_acks,
-                            self.recover,
-                        );
-                    }
-
-                    if let Some(&missing_seq) = self.unacknowledged.first() {
-                        println!(
-                            "{} -> [Fast Retransmit] Resending lost packet seq {}",
-                            self.name, missing_seq
-                        );
-                        self.send(Packet::rand_data(missing_seq, 20), peer_addr, link, logger);
-                    }
-                } else if self.limited_transmit && self.dup_acks < 3 {
-                    let next_unsent_seq =
-                        self.unacknowledged.last().map_or(21000, |last| last + 1000);
-
-                    if self.flight_size() < self.send_window() + 2 {
-                        println!(
-                            "{} -> [Limited Transmit] DupACK #{} received! Transmitting new seq {}",
-                            self.name, self.dup_acks, next_unsent_seq
-                        );
-                        self.send(
-                            Packet::rand_data(next_unsent_seq, 20),
-                            peer_addr,
-                            link,
-                            logger,
-                        );
-                    }
-                } else if let Some(log) = logger {
-                    log.log_state(
-                        "DupACK Received",
-                        self.cwnd,
-                        self.ssthresh,
-                        self.dup_acks,
-                        self.recover,
-                    );
-                }
-            } else {
-                self.cwnd += self.smss;
-                if let Some(log) = logger {
-                    log.log_state(
-                        "DupACK (Inflate cwnd)",
-                        self.cwnd,
-                        self.ssthresh,
-                        self.dup_acks,
-                        self.recover,
-                    );
-                }
+        if self.in_fast_recovery {
+            self.cwnd += self.smss;
+            if let Some(log) = logger {
+                log.log_state(
+                    "DupACK (Inflate cwnd)",
+                    self.cwnd,
+                    self.ssthresh,
+                    self.dup_acks,
+                    self.recover,
+                );
             }
+            return;
+        }
+
+        if self.dup_acks == 3 {
+            println!(
+                "{} -> 3x DupACK ({ack_seq}), triggering Fast Retransmit.",
+                self.name
+            );
+            self.recover = *self.unacknowledged.last().unwrap_or(&ack_seq);
+            let flight_size = self.flight_size();
+            self.ssthresh = (flight_size / 2).max(2 * self.smss);
+            self.cwnd = self.ssthresh + 3 * self.smss;
+            self.in_fast_recovery = true;
+
+            if let Some(log) = logger {
+                log.log_state(
+                    "Fast Retransmit",
+                    self.cwnd,
+                    self.ssthresh,
+                    self.dup_acks,
+                    self.recover,
+                );
+            }
+
+            if let Some(&missing_seq) = self.unacknowledged.first() {
+                self.send(Packet::rand_data(missing_seq, 20), peer_addr, link, logger);
+            }
+        } else if self.limited_transmit && self.dup_acks < 3 {
+            let next_unsent_seq = self.unacknowledged.last().map_or(21000, |last| last + 1000);
+
+            if self.flight_size() < self.send_window() + 2 {
+                println!(
+                    "{} -> [Limited Transmit] DupACK #{}, sending {next_unsent_seq}",
+                    self.name, self.dup_acks
+                );
+                self.send(
+                    Packet::rand_data(next_unsent_seq, 20),
+                    peer_addr,
+                    link,
+                    logger,
+                );
+            }
+        } else if let Some(log) = logger {
+            log.log_state(
+                "DupACK Received",
+                self.cwnd,
+                self.ssthresh,
+                self.dup_acks,
+                self.recover,
+            );
         }
     }
 
     fn print(&self) {
-        let phase = if self.in_fast_recovery {
-            "FAST RECOVERY"
-        } else if self.cwnd < self.ssthresh {
-            "SLOW START"
-        } else {
-            "CONGESTION AVOIDANCE"
-        };
-
-        let unack_str = format!("{:?}", self.unacknowledged);
-
-        println!("┌──────────────────────────────────────────────┐");
-        println!("│ {:<44} │", format!("Endpoint: {} [{}]", self.name, phase));
-        println!("├──────────────────────────────────────────────┤");
-        println!("│ Address:          {:<26} │", self.address);
-        println!("│ cwnd:             {:<26} │", self.cwnd);
-        println!("│ ssthresh:         {:<26} │", self.ssthresh);
-        println!("│ dup_acks:         {:<26} │", self.dup_acks);
-        println!("│ limited_transmit: {:<26} │", self.limited_transmit);
-        println!("│ recover:          {:<26} │", self.recover);
-        println!("│ FlightSize:       {:<26} │", self.flight_size());
-        println!("│ unacknowledged:   {:<26} │", unack_str);
-        println!("└──────────────────────────────────────────────┘\n");
+        println!(
+            "[{}] address={} cwnd={} ssthresh={} dup_acks={} lt={} recover={} flight={}",
+            self.name,
+            self.address,
+            self.cwnd,
+            self.ssthresh,
+            self.dup_acks,
+            self.limited_transmit,
+            self.recover,
+            self.flight_size()
+        );
+        println!("  unacknowledged: {:?}", self.unacknowledged);
     }
 }
 
@@ -461,10 +408,7 @@ fn receive_and_ack_with_dups(
                 receiver.send(Packet::new_ack(*expected_seq), sender_addr, link, &mut None);
             } else {
                 let last_ack = *expected_seq;
-                println!(
-                    "--> Out-of-order seq {}! Sending duplicate ACK for {}",
-                    seq, last_ack
-                );
+                println!("--> Out-of-order seq {seq}! DupACK for {last_ack}");
                 if let Some(log) = logger {
                     log.log_send_ack(last_ack, true);
                 }
@@ -474,13 +418,190 @@ fn receive_and_ack_with_dups(
     }
 }
 
+fn run_exercise_1() {
+    let filename = "exercise-1.typ";
+    let mut logger = DiagramLogger::new(filename);
+    let mut link = Link::new();
+    link.capacity = 20;
+
+    let mut alice = TCP::new("Alice", &mut link).with_limited_transmit(false);
+    let mut bob = TCP::new("Bob", &mut link);
+
+    alice.cwnd = 8;
+    alice.ssthresh = 64;
+
+    logger.log_state("Initial State", alice.cwnd, alice.ssthresh, 0, 0);
+
+    for i in 0..8 {
+        let seq = 21000 + (i * 1000);
+        alice.send(
+            Packet::rand_data(seq, 20),
+            bob.address,
+            &mut link,
+            &mut Some(&mut logger),
+        );
+    }
+    alice.print();
+
+    if let Some(channel) = link.channels.get_mut(&bob.address) {
+        channel.remove(5);
+        channel.remove(4);
+        channel.remove(0);
+
+        logger.log_loss(21000);
+        logger.log_loss(25000);
+        logger.log_loss(26000);
+    }
+
+    let mut bobs_expected_seq = 21000;
+    receive_and_ack_with_dups(
+        &mut bob,
+        alice.address,
+        &mut link,
+        &mut bobs_expected_seq,
+        &mut Some(&mut logger),
+    );
+
+    drain_channel(&mut alice, &mut link, bob.address, &mut Some(&mut logger));
+    alice.print();
+
+    while let Some(packet) = bob.receive(&mut link, alice.address, &mut None) {
+        if let Packet::Data { seq, .. } = packet {
+            if seq == 21000 {
+                bobs_expected_seq = 25000;
+                logger.log_send_ack(25000, false);
+                bob.send(Packet::new_ack(25000), alice.address, &mut link, &mut None);
+            }
+        }
+    }
+
+    drain_channel(&mut alice, &mut link, bob.address, &mut Some(&mut logger));
+    alice.print();
+
+    while let Some(packet) = bob.receive(&mut link, alice.address, &mut None) {
+        if let Packet::Data { seq, .. } = packet {
+            if seq == 25000 {
+                bobs_expected_seq = 26000;
+                logger.log_send_ack(26000, false);
+                bob.send(Packet::new_ack(26000), alice.address, &mut link, &mut None);
+            }
+        }
+    }
+
+    drain_channel(&mut alice, &mut link, bob.address, &mut Some(&mut logger));
+    alice.print();
+
+    while let Some(packet) = bob.receive(&mut link, alice.address, &mut None) {
+        if let Packet::Data { seq, .. } = packet {
+            if seq == 26000 {
+                bobs_expected_seq = 29000;
+                logger.log_send_ack(29000, false);
+                bob.send(Packet::new_ack(29000), alice.address, &mut link, &mut None);
+            }
+        }
+    }
+
+    drain_channel(&mut alice, &mut link, bob.address, &mut Some(&mut logger));
+
+    println!("Bob's expected seq: {bobs_expected_seq}");
+    alice.print();
+
+    logger.finish(filename);
+}
+
+fn run_exercise_2() {
+    let filename = "exercise-2.typ";
+    let mut logger = DiagramLogger::new(filename);
+    let mut link = Link::new();
+    link.capacity = 20;
+
+    let mut alice = TCP::new("Alice", &mut link).with_limited_transmit(false);
+    let mut bob = TCP::new("Bob", &mut link);
+
+    alice.cwnd = 6;
+    alice.ssthresh = 64;
+
+    logger.log_state("Initial State", alice.cwnd, alice.ssthresh, 0, 0);
+
+    for i in 0..6 {
+        let seq = 21000 + (i * 1000);
+        alice.send(
+            Packet::rand_data(seq, 20),
+            bob.address,
+            &mut link,
+            &mut Some(&mut logger),
+        );
+    }
+    alice.print();
+
+    if let Some(channel) = link.channels.get_mut(&bob.address) {
+        channel.remove(3);
+        channel.remove(1);
+        channel.remove(0);
+
+        logger.log_loss(21000);
+        logger.log_loss(22000);
+        logger.log_loss(24000);
+    }
+
+    let mut bobs_expected_seq = 21000;
+    receive_and_ack_with_dups(
+        &mut bob,
+        alice.address,
+        &mut link,
+        &mut bobs_expected_seq,
+        &mut Some(&mut logger),
+    );
+
+    drain_channel(&mut alice, &mut link, bob.address, &mut Some(&mut logger));
+    alice.print();
+
+    while let Some(packet) = bob.receive(&mut link, alice.address, &mut None) {
+        if let Packet::Data { seq, .. } = packet {
+            if seq == 21000 {
+                bobs_expected_seq = 22000;
+                logger.log_send_ack(22000, false);
+                bob.send(Packet::new_ack(22000), alice.address, &mut link, &mut None);
+            }
+        }
+    }
+
+    drain_channel(&mut alice, &mut link, bob.address, &mut Some(&mut logger));
+    alice.print();
+
+    while let Some(packet) = bob.receive(&mut link, alice.address, &mut None) {
+        if let Packet::Data { seq, .. } = packet {
+            if seq == 22000 {
+                bobs_expected_seq = 24000;
+                logger.log_send_ack(24000, false);
+                bob.send(Packet::new_ack(24000), alice.address, &mut link, &mut None);
+            }
+        }
+    }
+
+    drain_channel(&mut alice, &mut link, bob.address, &mut Some(&mut logger));
+    alice.print();
+
+    while let Some(packet) = bob.receive(&mut link, alice.address, &mut None) {
+        if let Packet::Data { seq, .. } = packet {
+            if seq == 24000 {
+                bobs_expected_seq = 27000;
+                logger.log_send_ack(27000, false);
+                bob.send(Packet::new_ack(27000), alice.address, &mut link, &mut None);
+            }
+        }
+    }
+
+    drain_channel(&mut alice, &mut link, bob.address, &mut Some(&mut logger));
+
+    println!("Bob's expected seq: {bobs_expected_seq}");
+    alice.print();
+
+    logger.finish(filename);
+}
+
 fn run_exercise_3() {
     let filename = "exercise-3.typ";
-    println!("\n==================================================");
-    println!("  EXERCISE 3 SCENARIO: cwnd=6 MSS WITH Limited Transmit (RFC 3042)");
-    println!("  Outputting diagram to: {}", filename);
-    println!("==================================================\n");
-
     let mut logger = DiagramLogger::new(filename);
     let mut link = Link::new();
     link.capacity = 20;
@@ -493,8 +614,6 @@ fn run_exercise_3() {
 
     logger.log_state("Initial State", alice.cwnd, alice.ssthresh, 0, 0);
 
-    // 1. Alice sends initial 6 MSS segments (21000..26000)
-    println!("--- Step 1: Alice transmits initial window of 6 segments (21000..26000) ---");
     for i in 0..6 {
         let seq = 21000 + (i * 1000);
         alice.send(
@@ -506,64 +625,42 @@ fn run_exercise_3() {
     }
     alice.print();
 
-    // 2. Network drops 1st (21000), 2nd (22000), and 4th (24000)
     if let Some(channel) = link.channels.get_mut(&bob.address) {
-        channel.remove(3); // Removes 24000 (4th)
-        channel.remove(1); // Removes 22000 (2nd)
-        channel.remove(0); // Removes 21000 (1st)
+        channel.remove(3);
+        channel.remove(1);
+        channel.remove(0);
 
         logger.log_loss(21000);
         logger.log_loss(22000);
         logger.log_loss(24000);
-
-        println!(
-            "*** [NETWORK LOSS: Segments 21000 (1st), 22000 (2nd), and 24000 (4th) dropped] ***\n"
-        );
     }
 
-    // 3. Bob receives Seg 3 (23000) -> DupACK 21000 (#1)
     let mut bobs_expected_seq = 21000;
-    println!("--- Step 2: Bob receives Seg 3 (23000) -> Sends DupACK #1 ---");
+
     while let Some(packet) = bob.receive(&mut link, alice.address, &mut None) {
         if let Packet::Data { seq, .. } = packet {
-            println!(
-                "--> Out-of-order seq {}! Sending duplicate ACK for 21000",
-                seq
-            );
+            println!("--> Out-of-order seq {seq}! DupACK for 21000");
             logger.log_send_ack(21000, true);
             bob.send(Packet::new_ack(21000), alice.address, &mut link, &mut None);
             break;
         }
     }
 
-    // 4. Alice receives DupACK #1 -> Limited Transmit sends Seg 7 (27000)
-    println!("\n--- Step 3: Alice processes DupACK #1 -> Limited Transmit sends Seg 7 (27000) ---");
     drain_channel(&mut alice, &mut link, bob.address, &mut Some(&mut logger));
     alice.print();
 
-    // 5. Bob receives Seg 5 (25000) -> Sends DupACK #2
-    println!("\n--- Step 4: Bob receives Seg 5 (25000) -> Sends DupACK #2 ---");
     while let Some(packet) = bob.receive(&mut link, alice.address, &mut None) {
         if let Packet::Data { seq, .. } = packet {
-            println!(
-                "--> Out-of-order seq {}! Sending duplicate ACK for 21000",
-                seq
-            );
+            println!("--> Out-of-order seq {seq}! DupACK for 21000");
             logger.log_send_ack(21000, true);
             bob.send(Packet::new_ack(21000), alice.address, &mut link, &mut None);
             break;
         }
     }
 
-    // 6. Alice receives DupACK #2 -> Limited Transmit sends Seg 8 (28000)
-    println!("\n--- Step 5: Alice processes DupACK #2 -> Limited Transmit sends Seg 8 (28000) ---");
     drain_channel(&mut alice, &mut link, bob.address, &mut Some(&mut logger));
     alice.print();
 
-    // 7. Bob receives surviving Seg 6 (26000), Seg 7 (27000), Seg 8 (28000) -> DupACKs #3, #4, #5
-    println!(
-        "\n--- Step 6: Bob receives remaining segments (26000, 27000, 28000) -> Sends DupACKs ---"
-    );
     receive_and_ack_with_dups(
         &mut bob,
         alice.address,
@@ -572,68 +669,48 @@ fn run_exercise_3() {
         &mut Some(&mut logger),
     );
 
-    // 8. Alice processes DupACK #3, #4, #5 -> Fast Retransmit Seg 1 (21000) & Inflates cwnd
-    println!("\n--- Step 7: Alice processes DupACKs #3, #4, #5 -> Triggers Fast Retransmit ---");
     drain_channel(&mut alice, &mut link, bob.address, &mut Some(&mut logger));
     alice.print();
 
-    // 9. Bob receives retransmitted 21000 -> Partial ACK 22000
-    println!("\n--- Step 8: Bob receives retransmitted 21000 -> Sends Partial ACK (22000) ---");
     while let Some(packet) = bob.receive(&mut link, alice.address, &mut None) {
         if let Packet::Data { seq, .. } = packet {
             if seq == 21000 {
                 bobs_expected_seq = 22000;
-                println!("--> Received 21000! Sending Partial ACK for 22000");
                 logger.log_send_ack(22000, false);
                 bob.send(Packet::new_ack(22000), alice.address, &mut link, &mut None);
             }
         }
     }
 
-    // 10. Alice processes Partial ACK 22000 -> Retransmits Seg 2 (22000)
-    println!("\n--- Step 9: Alice processes Partial ACK (22000) & retransmits Seg 2 (22000) ---");
     drain_channel(&mut alice, &mut link, bob.address, &mut Some(&mut logger));
     alice.print();
 
-    // 11. Bob receives 22000 -> Partial ACK 24000
-    println!("\n--- Step 10: Bob receives 22000 -> Sends Partial ACK (24000) ---");
     while let Some(packet) = bob.receive(&mut link, alice.address, &mut None) {
         if let Packet::Data { seq, .. } = packet {
             if seq == 22000 {
                 bobs_expected_seq = 24000;
-                println!("--> Received 22000! Sending Partial ACK for 24000");
                 logger.log_send_ack(24000, false);
                 bob.send(Packet::new_ack(24000), alice.address, &mut link, &mut None);
             }
         }
     }
 
-    // 12. Alice processes Partial ACK 24000 -> Retransmits Seg 4 (24000)
-    println!("\n--- Step 11: Alice processes Partial ACK (24000) & retransmits Seg 4 (24000) ---");
     drain_channel(&mut alice, &mut link, bob.address, &mut Some(&mut logger));
     alice.print();
 
-    // 13. Bob receives 24000 -> Full ACK 29000
-    println!("\n--- Step 12: Bob receives 24000 -> Sends FULL ACK (29000) ---");
     while let Some(packet) = bob.receive(&mut link, alice.address, &mut None) {
         if let Packet::Data { seq, .. } = packet {
             if seq == 24000 {
                 bobs_expected_seq = 29000;
-                println!(
-                    "--> Received 24000! Buffer now complete through 28000. Sending FULL ACK for 29000"
-                );
                 logger.log_send_ack(29000, false);
                 bob.send(Packet::new_ack(29000), alice.address, &mut link, &mut None);
             }
         }
     }
 
-    // 14. Alice processes FULL ACK 29000 -> Exits Fast Recovery
-    println!("\n--- Step 13: Alice processes Full ACK (29000) & Exits Fast Recovery ---");
     drain_channel(&mut alice, &mut link, bob.address, &mut Some(&mut logger));
 
-    println!("Bob's expected seq: {}", bobs_expected_seq);
-    println!("\n--- FINAL POST-RECOVERY STATE ---");
+    println!("Bob's expected seq: {bobs_expected_seq}");
     alice.print();
 
     logger.finish(filename);
@@ -643,13 +720,12 @@ fn main() {
     let args = Args::parse();
 
     if args.exercise_1 {
-        // ... (run_exercise_1)
+        run_exercise_1();
     } else if args.exercise_2 {
-        // ... (run_exercise_2)
+        run_exercise_2();
     } else if args.exercise_3 {
         run_exercise_3();
     } else {
-        println!("No exercise flag provided.");
-        println!("Run with `--exercise-1`, `--exercise-2`, or `--exercise-3`.");
+        println!("Please specify an exercise flag: --exercise-1, --exercise-2, or --exercise-3");
     }
 }
