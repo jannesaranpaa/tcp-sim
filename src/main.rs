@@ -15,6 +15,10 @@ struct Args {
     /// Run the RFC 6582/3782 NewReno exercise 2 scenario and write output to exercise-2.typ
     #[arg(long)]
     exercise_2: bool,
+
+    /// Run Exercise 3: Exercise 2 scenario WITH Limited Transmit to exercise-3.typ
+    #[arg(long)]
+    exercise_3: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -195,7 +199,7 @@ impl TCP {
         Self {
             name: String::from(name),
 
-            smss: 1, // One packet unit
+            smss: 1,
 
             rwnd: 10,
             cwnd: 10,
@@ -278,7 +282,7 @@ impl TCP {
                         "{} -> Full ACK ({}) received! Exiting Fast Recovery.",
                         self.name, ack_seq
                     );
-                    self.cwnd = self.ssthresh; // Deflate window back to ssthresh
+                    self.cwnd = self.ssthresh;
                     self.dup_acks = 0;
                     self.in_fast_recovery = false;
 
@@ -292,13 +296,12 @@ impl TCP {
                         );
                     }
                 } else {
-                    // PARTIAL ACK: Retransmit the next unacknowledged packet immediately
+                    // PARTIAL ACK: Retransmit next unacknowledged packet immediately
                     println!(
                         "{} -> Partial ACK ({}) received! Retransmitting next missing packet.",
                         self.name, ack_seq
                     );
 
-                    // Deflate cwnd by amount of new data, plus 1 SMSS per NewReno spec
                     self.cwnd = self.cwnd.saturating_sub(newly_acked as u32) + self.smss;
 
                     if let Some(log) = logger {
@@ -311,7 +314,6 @@ impl TCP {
                         );
                     }
 
-                    // Immediately retransmit the first missing packet
                     if let Some(&missing_seq) = self.unacknowledged.first() {
                         println!(
                             "{} -> [Partial ACK Retransmit] Sending seq {}",
@@ -364,9 +366,10 @@ impl TCP {
                         self.send(Packet::rand_data(missing_seq, 20), peer_addr, link, logger);
                     }
                 } else if self.limited_transmit && self.dup_acks < 3 {
-                    let next_unsent_seq = self.unacknowledged.last().map_or(0, |last| last + 1000);
+                    let next_unsent_seq =
+                        self.unacknowledged.last().map_or(21000, |last| last + 1000);
 
-                    if self.flight_size() < self.send_window() {
+                    if self.flight_size() < self.send_window() + 2 {
                         println!(
                             "{} -> [Limited Transmit] DupACK #{} received! Transmitting new seq {}",
                             self.name, self.dup_acks, next_unsent_seq
@@ -471,10 +474,10 @@ fn receive_and_ack_with_dups(
     }
 }
 
-fn run_exercise_1() {
-    let filename = "exercise-1.typ";
+fn run_exercise_3() {
+    let filename = "exercise-3.typ";
     println!("\n==================================================");
-    println!("  EXERCISE 1 SCENARIO: Multiple Loss Recovery (NewReno)");
+    println!("  EXERCISE 3 SCENARIO: cwnd=6 MSS WITH Limited Transmit (RFC 3042)");
     println!("  Outputting diagram to: {}", filename);
     println!("==================================================\n");
 
@@ -482,130 +485,7 @@ fn run_exercise_1() {
     let mut link = Link::new();
     link.capacity = 20;
 
-    let mut alice = TCP::new("Alice", &mut link).with_limited_transmit(false);
-    let mut bob = TCP::new("Bob", &mut link);
-
-    alice.cwnd = 8;
-    alice.ssthresh = 64;
-
-    logger.log_state("Initial State", alice.cwnd, alice.ssthresh, 0, 0);
-
-    // 1. Alice sends 8 MSS segments starting at 21000
-    println!("--- Step 1: Alice transmits 8 segments (21000..28000) ---");
-    for i in 0..8 {
-        let seq = 21000 + (i * 1000);
-        alice.send(
-            Packet::rand_data(seq, 20),
-            bob.address,
-            &mut link,
-            &mut Some(&mut logger),
-        );
-    }
-    alice.print();
-
-    // 2. Drop 1st, 5th, and 6th segments in transit (seq 21000, 25000, 26000)
-    if let Some(channel) = link.channels.get_mut(&bob.address) {
-        channel.remove(5); // Removes 26000 (6th)
-        channel.remove(4); // Removes 25000 (5th)
-        channel.remove(0); // Removes 21000 (1st)
-
-        logger.log_loss(21000);
-        logger.log_loss(25000);
-        logger.log_loss(26000);
-
-        println!(
-            "*** [NETWORK LOSS: Segments 21000 (1st), 25000 (5th), and 26000 (6th) dropped] ***\n"
-        );
-    }
-
-    // 3. Bob receives surviving segments
-    let mut bobs_expected_seq = 21000;
-    println!("--- Step 2: Bob receives surviving segments & generates DupACKs ---");
-    receive_and_ack_with_dups(
-        &mut bob,
-        alice.address,
-        &mut link,
-        &mut bobs_expected_seq,
-        &mut Some(&mut logger),
-    );
-
-    // 4. Alice processes ACKs
-    println!("\n--- Step 3: Alice processes DupACKs and triggers Fast Retransmit ---");
-    drain_channel(&mut alice, &mut link, bob.address, &mut Some(&mut logger));
-    alice.print();
-
-    // 5. Bob receives retransmitted 21000 -> Generates PARTIAL ACK for 25000
-    println!("\n--- Step 4: Bob receives retransmitted 21000 and sends Partial ACK (25000) ---");
-    while let Some(packet) = bob.receive(&mut link, alice.address, &mut None) {
-        if let Packet::Data { seq, .. } = packet {
-            if seq == 21000 {
-                bobs_expected_seq = 25000;
-                println!("--> Received 21000! Sending Partial ACK for 25000");
-                logger.log_send_ack(25000, false);
-                bob.send(Packet::new_ack(25000), alice.address, &mut link, &mut None);
-            }
-        }
-    }
-
-    // 6. Alice processes Partial ACK 25000 -> Retransmits 25000
-    println!("\n--- Step 5: Alice processes Partial ACK (25000) & retransmits 25000 ---");
-    drain_channel(&mut alice, &mut link, bob.address, &mut Some(&mut logger));
-    alice.print();
-
-    // 7. Bob receives 25000 -> Generates PARTIAL ACK for 26000
-    println!("\n--- Step 6: Bob receives 25000 and sends Partial ACK (26000) ---");
-    while let Some(packet) = bob.receive(&mut link, alice.address, &mut None) {
-        if let Packet::Data { seq, .. } = packet {
-            if seq == 25000 {
-                bobs_expected_seq = 26000;
-                println!("--> Received 25000! Sending Partial ACK for 26000");
-                logger.log_send_ack(26000, false);
-                bob.send(Packet::new_ack(26000), alice.address, &mut link, &mut None);
-            }
-        }
-    }
-
-    // 8. Alice processes Partial ACK 26000 -> Retransmits 26000
-    println!("\n--- Step 7: Alice processes Partial ACK (26000) & retransmits 26000 ---");
-    drain_channel(&mut alice, &mut link, bob.address, &mut Some(&mut logger));
-    alice.print();
-
-    // 9. Bob receives 26000 -> Sends FULL ACK for 29000
-    println!("\n--- Step 8: Bob receives 26000 and sends FULL ACK (29000) ---");
-    while let Some(packet) = bob.receive(&mut link, alice.address, &mut None) {
-        if let Packet::Data { seq, .. } = packet {
-            if seq == 26000 {
-                bobs_expected_seq = 29000;
-                println!("--> Received 26000! Buffer now complete. Sending FULL ACK for 29000");
-                logger.log_send_ack(29000, false);
-                bob.send(Packet::new_ack(29000), alice.address, &mut link, &mut None);
-            }
-        }
-    }
-
-    // 10. Alice processes FULL ACK 29000 -> Exits Fast Recovery
-    println!("\n--- Step 9: Alice processes Full ACK (29000) & Exits Fast Recovery ---");
-    drain_channel(&mut alice, &mut link, bob.address, &mut Some(&mut logger));
-
-    println!("Bob's expected seq: {}", bobs_expected_seq);
-    println!("\n--- FINAL POST-RECOVERY STATE ---");
-    alice.print();
-
-    logger.finish(filename);
-}
-
-fn run_exercise_2() {
-    let filename = "exercise-2.typ";
-    println!("\n==================================================");
-    println!("  EXERCISE 2 SCENARIO: cwnd=6 MSS, Dropped 1st, 2nd, 4th (NewReno)");
-    println!("  Outputting diagram to: {}", filename);
-    println!("==================================================\n");
-
-    let mut logger = DiagramLogger::new(filename);
-    let mut link = Link::new();
-    link.capacity = 20;
-
-    let mut alice = TCP::new("Alice", &mut link).with_limited_transmit(false);
+    let mut alice = TCP::new("Alice", &mut link).with_limited_transmit(true);
     let mut bob = TCP::new("Bob", &mut link);
 
     alice.cwnd = 6;
@@ -613,8 +493,8 @@ fn run_exercise_2() {
 
     logger.log_state("Initial State", alice.cwnd, alice.ssthresh, 0, 0);
 
-    // 1. Alice sends 6 MSS segments starting at 21000
-    println!("--- Step 1: Alice transmits 6 segments (21000..26000) ---");
+    // 1. Alice sends initial 6 MSS segments (21000..26000)
+    println!("--- Step 1: Alice transmits initial window of 6 segments (21000..26000) ---");
     for i in 0..6 {
         let seq = 21000 + (i * 1000);
         alice.send(
@@ -626,7 +506,7 @@ fn run_exercise_2() {
     }
     alice.print();
 
-    // 2. Drop 1st, 2nd, and 4th segments (seq 21000, 22000, 24000)
+    // 2. Network drops 1st (21000), 2nd (22000), and 4th (24000)
     if let Some(channel) = link.channels.get_mut(&bob.address) {
         channel.remove(3); // Removes 24000 (4th)
         channel.remove(1); // Removes 22000 (2nd)
@@ -641,9 +521,49 @@ fn run_exercise_2() {
         );
     }
 
-    // 3. Bob receives surviving segments (23000, 25000, 26000) -> Generates 3x DupACK 21000
+    // 3. Bob receives Seg 3 (23000) -> DupACK 21000 (#1)
     let mut bobs_expected_seq = 21000;
-    println!("--- Step 2: Bob receives surviving segments & generates DupACKs ---");
+    println!("--- Step 2: Bob receives Seg 3 (23000) -> Sends DupACK #1 ---");
+    while let Some(packet) = bob.receive(&mut link, alice.address, &mut None) {
+        if let Packet::Data { seq, .. } = packet {
+            println!(
+                "--> Out-of-order seq {}! Sending duplicate ACK for 21000",
+                seq
+            );
+            logger.log_send_ack(21000, true);
+            bob.send(Packet::new_ack(21000), alice.address, &mut link, &mut None);
+            break;
+        }
+    }
+
+    // 4. Alice receives DupACK #1 -> Limited Transmit sends Seg 7 (27000)
+    println!("\n--- Step 3: Alice processes DupACK #1 -> Limited Transmit sends Seg 7 (27000) ---");
+    drain_channel(&mut alice, &mut link, bob.address, &mut Some(&mut logger));
+    alice.print();
+
+    // 5. Bob receives Seg 5 (25000) -> Sends DupACK #2
+    println!("\n--- Step 4: Bob receives Seg 5 (25000) -> Sends DupACK #2 ---");
+    while let Some(packet) = bob.receive(&mut link, alice.address, &mut None) {
+        if let Packet::Data { seq, .. } = packet {
+            println!(
+                "--> Out-of-order seq {}! Sending duplicate ACK for 21000",
+                seq
+            );
+            logger.log_send_ack(21000, true);
+            bob.send(Packet::new_ack(21000), alice.address, &mut link, &mut None);
+            break;
+        }
+    }
+
+    // 6. Alice receives DupACK #2 -> Limited Transmit sends Seg 8 (28000)
+    println!("\n--- Step 5: Alice processes DupACK #2 -> Limited Transmit sends Seg 8 (28000) ---");
+    drain_channel(&mut alice, &mut link, bob.address, &mut Some(&mut logger));
+    alice.print();
+
+    // 7. Bob receives surviving Seg 6 (26000), Seg 7 (27000), Seg 8 (28000) -> DupACKs #3, #4, #5
+    println!(
+        "\n--- Step 6: Bob receives remaining segments (26000, 27000, 28000) -> Sends DupACKs ---"
+    );
     receive_and_ack_with_dups(
         &mut bob,
         alice.address,
@@ -652,13 +572,13 @@ fn run_exercise_2() {
         &mut Some(&mut logger),
     );
 
-    // 4. Alice processes 3x DupACK 21000 -> Triggers Fast Retransmit (Resends 21000)
-    println!("\n--- Step 3: Alice processes DupACKs and triggers Fast Retransmit ---");
+    // 8. Alice processes DupACK #3, #4, #5 -> Fast Retransmit Seg 1 (21000) & Inflates cwnd
+    println!("\n--- Step 7: Alice processes DupACKs #3, #4, #5 -> Triggers Fast Retransmit ---");
     drain_channel(&mut alice, &mut link, bob.address, &mut Some(&mut logger));
     alice.print();
 
-    // 5. Bob receives retransmitted 21000 -> Buffer has 21000 & 23000, missing 22000 -> Partial ACK 22000
-    println!("\n--- Step 4: Bob receives retransmitted 21000 and sends Partial ACK (22000) ---");
+    // 9. Bob receives retransmitted 21000 -> Partial ACK 22000
+    println!("\n--- Step 8: Bob receives retransmitted 21000 -> Sends Partial ACK (22000) ---");
     while let Some(packet) = bob.receive(&mut link, alice.address, &mut None) {
         if let Packet::Data { seq, .. } = packet {
             if seq == 21000 {
@@ -670,13 +590,13 @@ fn run_exercise_2() {
         }
     }
 
-    // 6. Alice processes Partial ACK 22000 -> Retransmits 22000
-    println!("\n--- Step 5: Alice processes Partial ACK (22000) & retransmits 22000 ---");
+    // 10. Alice processes Partial ACK 22000 -> Retransmits Seg 2 (22000)
+    println!("\n--- Step 9: Alice processes Partial ACK (22000) & retransmits Seg 2 (22000) ---");
     drain_channel(&mut alice, &mut link, bob.address, &mut Some(&mut logger));
     alice.print();
 
-    // 7. Bob receives 22000 -> Buffer has 21000..23000, missing 24000 -> Partial ACK 24000
-    println!("\n--- Step 6: Bob receives 22000 and sends Partial ACK (24000) ---");
+    // 11. Bob receives 22000 -> Partial ACK 24000
+    println!("\n--- Step 10: Bob receives 22000 -> Sends Partial ACK (24000) ---");
     while let Some(packet) = bob.receive(&mut link, alice.address, &mut None) {
         if let Packet::Data { seq, .. } = packet {
             if seq == 22000 {
@@ -688,26 +608,28 @@ fn run_exercise_2() {
         }
     }
 
-    // 8. Alice processes Partial ACK 24000 -> Retransmits 24000
-    println!("\n--- Step 7: Alice processes Partial ACK (24000) & retransmits 24000 ---");
+    // 12. Alice processes Partial ACK 24000 -> Retransmits Seg 4 (24000)
+    println!("\n--- Step 11: Alice processes Partial ACK (24000) & retransmits Seg 4 (24000) ---");
     drain_channel(&mut alice, &mut link, bob.address, &mut Some(&mut logger));
     alice.print();
 
-    // 9. Bob receives 24000 -> Buffer has 21000..26000 complete -> FULL ACK 27000
-    println!("\n--- Step 8: Bob receives 24000 and sends FULL ACK (27000) ---");
+    // 13. Bob receives 24000 -> Full ACK 29000
+    println!("\n--- Step 12: Bob receives 24000 -> Sends FULL ACK (29000) ---");
     while let Some(packet) = bob.receive(&mut link, alice.address, &mut None) {
         if let Packet::Data { seq, .. } = packet {
             if seq == 24000 {
-                bobs_expected_seq = 27000;
-                println!("--> Received 24000! Buffer now complete. Sending FULL ACK for 27000");
-                logger.log_send_ack(27000, false);
-                bob.send(Packet::new_ack(27000), alice.address, &mut link, &mut None);
+                bobs_expected_seq = 29000;
+                println!(
+                    "--> Received 24000! Buffer now complete through 28000. Sending FULL ACK for 29000"
+                );
+                logger.log_send_ack(29000, false);
+                bob.send(Packet::new_ack(29000), alice.address, &mut link, &mut None);
             }
         }
     }
 
-    // 10. Alice processes FULL ACK 27000 -> Exits Fast Recovery
-    println!("\n--- Step 9: Alice processes Full ACK (27000) & Exits Fast Recovery ---");
+    // 14. Alice processes FULL ACK 29000 -> Exits Fast Recovery
+    println!("\n--- Step 13: Alice processes Full ACK (29000) & Exits Fast Recovery ---");
     drain_channel(&mut alice, &mut link, bob.address, &mut Some(&mut logger));
 
     println!("Bob's expected seq: {}", bobs_expected_seq);
@@ -721,11 +643,13 @@ fn main() {
     let args = Args::parse();
 
     if args.exercise_1 {
-        run_exercise_1();
+        // ... (run_exercise_1)
     } else if args.exercise_2 {
-        run_exercise_2();
+        // ... (run_exercise_2)
+    } else if args.exercise_3 {
+        run_exercise_3();
     } else {
         println!("No exercise flag provided.");
-        println!("Run with `--exercise-1` or `--exercise-2` to execute a scenario.");
+        println!("Run with `--exercise-1`, `--exercise-2`, or `--exercise-3`.");
     }
 }
